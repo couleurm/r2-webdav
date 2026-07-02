@@ -115,6 +115,80 @@ function escapeXml(value: string): string {
 		.replaceAll("'", '&apos;');
 }
 
+function extractHttpMetadata(headers: Headers): R2HTTPMetadata {
+	let expires = headers.get('Expires');
+	let cacheExpiry = expires === null ? NaN : new Date(expires).getTime();
+	return {
+		contentType: headers.get('Content-Type') ?? undefined,
+		contentDisposition: headers.get('Content-Disposition') ?? undefined,
+		contentEncoding: headers.get('Content-Encoding') ?? undefined,
+		contentLanguage: headers.get('Content-Language') ?? undefined,
+		cacheControl: headers.get('Cache-Control') ?? undefined,
+		cacheExpiry: Number.isFinite(cacheExpiry) ? new Date(cacheExpiry) : undefined,
+	};
+}
+
+function parseETagHeader(headerValue: string): { weak: boolean; tag: string }[] {
+	return [...headerValue.matchAll(/(W\/)?"([^"]*)"/g)].map((match) => ({
+		weak: match[1] !== undefined,
+		tag: match[2],
+	}));
+}
+
+function parseHttpDate(headerValue: string): number | null {
+	let time = new Date(headerValue).getTime();
+	return Number.isFinite(time) ? time : null;
+}
+
+// Evaluates If-Match / If-Unmodified-Since / If-None-Match / If-Modified-Since
+// per RFC 7232 section 6. Returns 412, 304, or null when the request may proceed.
+// The WebDAV `If` header (lock tokens) is handled separately by assertLockPermission
+// and MUST NOT be treated as an HTTP precondition.
+function checkPreconditions(request: Request, object: R2Object | null): 412 | 304 | null {
+	let isReadRequest = request.method === 'GET' || request.method === 'HEAD';
+	let etag = object === null ? undefined : object.etag;
+	// HTTP dates have second granularity; truncate the stored timestamp to match.
+	let lastModified = object === null ? undefined : object.uploaded.getTime() - (object.uploaded.getTime() % 1000);
+
+	let ifMatch = request.headers.get('If-Match');
+	if (ifMatch !== null) {
+		if (object === null) {
+			return 412;
+		}
+		if (ifMatch.trim() !== '*' && !parseETagHeader(ifMatch).some((entry) => !entry.weak && entry.tag === etag)) {
+			return 412;
+		}
+	} else {
+		let ifUnmodifiedSince = request.headers.get('If-Unmodified-Since');
+		if (ifUnmodifiedSince !== null && object !== null && lastModified !== undefined) {
+			let time = parseHttpDate(ifUnmodifiedSince);
+			if (time !== null && lastModified > time) {
+				return 412;
+			}
+		}
+	}
+
+	let ifNoneMatch = request.headers.get('If-None-Match');
+	if (ifNoneMatch !== null) {
+		let matches =
+			object !== null &&
+			(ifNoneMatch.trim() === '*' || parseETagHeader(ifNoneMatch).some((entry) => entry.tag === etag));
+		if (matches) {
+			return isReadRequest ? 304 : 412;
+		}
+	} else if (isReadRequest) {
+		let ifModifiedSince = request.headers.get('If-Modified-Since');
+		if (ifModifiedSince !== null && object !== null && lastModified !== undefined) {
+			let time = parseHttpDate(ifModifiedSince);
+			if (time !== null && lastModified <= time) {
+				return 304;
+			}
+		}
+	}
+
+	return null;
+}
+
 function getResourceHref(key: string, isCollection: boolean): string {
 	const encodeHrefPath = (href: string): string => {
 		if (href === '/') {
@@ -533,9 +607,101 @@ function getRequestLockTokens(request: Request): string[] {
 	return [...new Set(lockTokens)];
 }
 
-function hasAlwaysFalseIfCondition(request: Request): boolean {
-	let ifHeader = request.headers.get('If') ?? '';
-	return ifHeader.includes('<DAV:no-lock>') && !ifHeader.includes('Not <DAV:no-lock>');
+type IfHeaderCondition = { negate: boolean; token: string | null; etag: string | null };
+type IfHeaderList = { resourceTag: string | null; conditions: IfHeaderCondition[] };
+
+// RFC 4918 section 10.4: If = ( 1*No-tag-list | 1*Tagged-list ), where each
+// list is "(" 1*( ["Not"] ( "<" state-token ">" | "[" entity-tag "]" ) ) ")"
+// and a Tagged-list is preceded by a "<" resource ">" tag.
+function parseIfHeader(ifHeader: string): IfHeaderList[] {
+	let lists: IfHeaderList[] = [];
+	let currentTag: string | null = null;
+	for (const match of ifHeader.matchAll(/<([^>]*)>|\(([^)]*)\)/g)) {
+		if (match[1] !== undefined) {
+			currentTag = match[1];
+			continue;
+		}
+		let conditions: IfHeaderCondition[] = [];
+		for (const condition of match[2].matchAll(/(Not\s+)?(?:<([^>]*)>|\[([^\]]*)\])/gi)) {
+			conditions.push({
+				negate: condition[1] !== undefined,
+				token: condition[2] ?? null,
+				etag: condition[3] ?? null,
+			});
+		}
+		lists.push({ resourceTag: currentTag, conditions });
+	}
+	return lists;
+}
+
+// Evaluates the WebDAV If header as a precondition: the request may proceed
+// only if at least one list holds for its resource (untagged lists apply to
+// the Request-URI resource). A state-token condition holds when the resource
+// is covered by a lock with that token; an entity-tag condition holds when
+// the resource's current etag matches.
+async function evaluateIfHeader(request: Request, bucket: R2Bucket): Promise<boolean> {
+	let ifHeader = request.headers.get('If');
+	if (ifHeader === null) {
+		return true;
+	}
+	let lists = parseIfHeader(ifHeader);
+	if (lists.length === 0) {
+		return true;
+	}
+
+	let requestPath = make_resource_path(request);
+	let resourceCache = new Map<string, R2Object | null>();
+	const headResource = async (path: string): Promise<R2Object | null> => {
+		if (!resourceCache.has(path)) {
+			resourceCache.set(path, path === '' ? null : await bucket.head(path));
+		}
+		return resourceCache.get(path) ?? null;
+	};
+	// Tokens of locks covering the resource: its own locks plus depth-infinity
+	// locks on ancestor collections.
+	const effectiveLockTokens = async (path: string): Promise<string[]> => {
+		let tokens: string[] = [];
+		for (let current = path; current !== ''; current = getParentPath(current)) {
+			let resource = await headResource(current);
+			for (const lockDetail of getLockDetails(resource?.customMetadata)) {
+				if (current === path || lockDetail.depth === 'infinity') {
+					tokens.push(lockDetail.token);
+				}
+			}
+		}
+		return tokens;
+	};
+
+	for (const list of lists) {
+		let path = list.resourceTag === null ? requestPath : parseDestinationPath(list.resourceTag, request.url);
+		if (path === null || list.conditions.length === 0) {
+			continue;
+		}
+		let resource = await headResource(path);
+		let lockTokens: string[] | null = null;
+		let listHolds = true;
+		for (const condition of list.conditions) {
+			let holds: boolean;
+			if (condition.token !== null) {
+				lockTokens = lockTokens ?? (await effectiveLockTokens(path));
+				holds = lockTokens.includes(normalizeLockToken(condition.token));
+			} else {
+				let conditionETag = (condition.etag ?? '').replace(/^W\//, '').replace(/^"|"$/g, '');
+				holds = resource !== null && conditionETag === resource.etag;
+			}
+			if (condition.negate) {
+				holds = !holds;
+			}
+			if (!holds) {
+				listHolds = false;
+				break;
+			}
+		}
+		if (listHolds) {
+			return true;
+		}
+	}
+	return false;
 }
 
 function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
@@ -549,20 +715,51 @@ function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
 	return mismatch === 0;
 }
 
-function extractLockOwner(body: string): string | undefined {
-	let owner = body.match(/<owner(?:\s[^>]*)?>([\s\S]*?)<\/owner>/i)?.[1];
-	if (owner === undefined) {
-		return undefined;
+// Parses a LOCK request body. Clients differ in how they write the lockinfo
+// XML: litmus uses the default namespace (<lockinfo xmlns="DAV:"><write/>),
+// while Windows MiniRedir uses a prefix (<D:lockinfo xmlns:D="DAV:"><D:write/>).
+// Matching on local names via a real XML parse handles both.
+function parseLockRequest(
+	body: string,
+): { scope: LockDetails['scope']; hasWriteType: boolean; owner: string | undefined } | null {
+	let doc = parseXmlDocument(body);
+	let root = doc?.documentElement;
+	if (!root || root.localName !== 'lockinfo') {
+		return null;
 	}
 
-	owner = owner.trim();
-	return owner === '' ? undefined : owner;
+	let scope: LockDetails['scope'] = 'exclusive';
+	let hasWriteType = false;
+	let owner: string | undefined;
+	for (const child of getChildElements(root)) {
+		switch (child.localName) {
+			case 'lockscope': {
+				if (getChildElements(child).some((element) => element.localName === 'shared')) {
+					scope = 'shared';
+				}
+				break;
+			}
+			case 'locktype': {
+				if (getChildElements(child).some((element) => element.localName === 'write')) {
+					hasWriteType = true;
+				}
+				break;
+			}
+			case 'owner': {
+				let serialized = serializeNodeChildren(child).trim();
+				owner = serialized === '' ? undefined : serialized;
+				break;
+			}
+		}
+	}
+	return { scope, hasWriteType, owner };
 }
 
 function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	if (object === null || object === undefined) {
 		return {
-			creationdate: new Date().toUTCString(),
+			// RFC 4918 section 15.1: creationdate is an ISO 8601 date-time.
+			creationdate: new Date().toISOString(),
 			displayname: undefined,
 			getcontentlanguage: undefined,
 			getcontentlength: '0',
@@ -578,12 +775,15 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	let isCollection = object.customMetadata?.resourcetype === '<collection />';
 	let lockDetails = getLockDetails(object.customMetadata);
 	return {
-		creationdate: object.uploaded.toUTCString(),
+		creationdate: object.uploaded.toISOString(),
 		displayname: object.httpMetadata?.contentDisposition,
 		getcontentlanguage: object.httpMetadata?.contentLanguage,
 		getcontentlength: object.size.toString(),
 		getcontenttype: object.httpMetadata?.contentType,
-		getetag: object.etag,
+		// RFC 4918 section 15.6: getetag uses the same format as the HTTP ETag
+		// header, i.e. the quoted form. It must also match the ETag returned by
+		// PUT/GET so clients (notably Windows MiniRedir) can correlate them.
+		getetag: object.httpEtag,
 		getlastmodified: object.uploaded.toUTCString(),
 		resourcetype: object.customMetadata?.resourcetype ?? '',
 		supportedlock: getSupportedLock(),
@@ -629,7 +829,7 @@ async function assertLockPermission(
 	resourcePath: string,
 	options: { ignoreSharedLocksOnTarget?: boolean } = {},
 ): Promise<Response | null> {
-	if (hasAlwaysFalseIfCondition(request)) {
+	if (!(await evaluateIfHeader(request, bucket))) {
 		return new Response('Precondition Failed', { status: 412 });
 	}
 	let lockTokens = getRequestLockTokens(request);
@@ -747,7 +947,6 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 		});
 	} else {
 		let object = await bucket.get(resource_path, {
-			onlyIf: request.headers,
 			range: request.headers,
 		});
 
@@ -757,7 +956,19 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 
 		if (object === null) {
 			return new Response('Not Found', { status: 404 });
-		} else if (!isR2ObjectBody(object)) {
+		}
+
+		let preconditionStatus = checkPreconditions(request, object);
+		if (preconditionStatus === 304) {
+			return new Response(null, {
+				status: 304,
+				headers: {
+					ETag: object.httpEtag,
+					'Last-Modified': object.uploaded.toUTCString(),
+				},
+			});
+		}
+		if (preconditionStatus === 412 || !isR2ObjectBody(object)) {
 			return new Response('Precondition Failed', { status: 412 });
 		} else {
 			const { rangeOffset, rangeEnd } = calcContentRange(object);
@@ -769,6 +980,8 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 					'Accept-Ranges': 'bytes',
 					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
 					'Content-Length': contentLength.toString(),
+					ETag: object.httpEtag,
+					'Last-Modified': object.uploaded.toUTCString(),
 					...(rangeRequested ? { 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` } : {}),
 					...(object.httpMetadata?.contentDisposition
 						? {
@@ -840,13 +1053,29 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 		}
 	}
 
+	// Evaluate HTTP preconditions explicitly. Passing `request.headers` as
+	// `onlyIf` is unsafe here: when the condition fails, R2 `put()` silently
+	// returns null without writing, and this handler would still report
+	// success — the client then ends up with the empty resource created by a
+	// prior LOCK (the "0 KB file" seen from Windows MiniRedir, issue #14).
+	if (checkPreconditions(request, existing) !== null) {
+		return new Response('Precondition Failed', { status: 412 });
+	}
+
 	let body = await request.arrayBuffer();
-	await bucket.put(resource_path, body, {
-		onlyIf: request.headers,
-		httpMetadata: request.headers,
+	let putResult = await bucket.put(resource_path, body, {
+		httpMetadata: extractHttpMetadata(request.headers),
 		customMetadata: getPreservedCustomMetadata(existing?.customMetadata),
 	});
-	return existing === null ? new Response('', { status: 201 }) : new Response(null, { status: 204 });
+	// Windows MiniRedir relies on the ETag of a PUT response to confirm the
+	// write and invalidate its cached PROPFIND state.
+	let responseHeaders = {
+		ETag: putResult.httpEtag,
+		'Last-Modified': putResult.uploaded.toUTCString(),
+	};
+	return existing === null
+		? new Response('', { status: 201, headers: responseHeaders })
+		: new Response(null, { status: 204, headers: responseHeaders });
 }
 
 async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
@@ -928,7 +1157,7 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	}
 
 	await bucket.put(resource_path, new Uint8Array(), {
-		httpMetadata: request.headers,
+		httpMetadata: extractHttpMetadata(request.headers),
 		customMetadata: { resourcetype: '<collection />' },
 	});
 	return new Response('', { status: 201 });
@@ -1368,12 +1597,13 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 	let { timeout, expiresAt } = parseTimeout(request.headers.get('Timeout'));
 	let body = await request.text();
 	// Per WebDAV, an empty LOCK request body indicates a lock refresh operation.
-	let requestedScope: LockDetails['scope'] = /<shared\b/i.test(body) ? 'shared' : 'exclusive';
-	let requestLockTokens = getRequestLockTokens(request);
-	if (body !== '' && !/<write\b/i.test(body)) {
+	let lockRequest = body === '' ? null : parseLockRequest(body);
+	if (body !== '' && (lockRequest === null || !lockRequest.hasWriteType)) {
 		return new Response('Bad Request', { status: 400 });
 	}
-	let owner = extractLockOwner(body);
+	let requestedScope: LockDetails['scope'] = lockRequest?.scope ?? 'exclusive';
+	let requestLockTokens = getRequestLockTokens(request);
+	let owner = lockRequest?.owner;
 	let lockResponse = await assertLockPermission(request, bucket, resource_path, {
 		ignoreSharedLocksOnTarget: body !== '' && requestedScope === 'shared',
 	});
@@ -1454,7 +1684,7 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 		return new Response('Not Found', { status: 404 });
 	}
 
-	await bucket.put(resource.key, source.body, {
+	let putResult = await bucket.put(resource.key, source.body, {
 		httpMetadata: source.httpMetadata,
 		customMetadata: withLockMetadata(resource.customMetadata, updatedLocks),
 	});
@@ -1466,6 +1696,7 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 			headers: {
 				'Content-Type': 'application/xml; charset=utf-8',
 				'Lock-Token': `<urn:uuid:${lockDetails.token}>`,
+				ETag: putResult.httpEtag,
 				...(existingLock
 					? {}
 					: {
@@ -1538,6 +1769,9 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 				headers: {
 					Allow: SUPPORT_METHODS.join(', '),
 					DAV: DAV_CLASS,
+					// Microsoft clients (WebDAV MiniRedir, Office) check this
+					// header to decide whether to author over WebDAV.
+					'MS-Author-Via': 'DAV',
 				},
 			});
 		}
@@ -1580,6 +1814,7 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 				headers: {
 					Allow: SUPPORT_METHODS.join(', '),
 					DAV: DAV_CLASS,
+					'MS-Author-Via': 'DAV',
 				},
 			});
 		}
@@ -1650,3 +1885,4 @@ export default {
 		return response;
 	},
 };
+
