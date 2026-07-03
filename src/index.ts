@@ -40,6 +40,82 @@ async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean =
 	} while (r2_objects.truncated);
 }
 
+// R2 has no real directories. A directory exists in one of two forms: an
+// explicit zero-byte marker object with `resourcetype: '<collection />'`
+// custom metadata (created by MKCOL), or implicitly as a slash-separated key
+// prefix of other objects (anything uploaded through the S3 API or the
+// dashboard). Implicit directories have no backing R2Object, so listings
+// represent them with this synthetic entry.
+type DirectoryEntry = {
+	kind: 'directory';
+	key: string; // without trailing slash; '' is the bucket root
+};
+
+function isDirectoryEntry(entry: R2Object | DirectoryEntry): entry is DirectoryEntry {
+	return 'kind' in entry && entry.kind === 'directory';
+}
+
+function isCollectionEntry(entry: R2Object | DirectoryEntry): boolean {
+	return isDirectoryEntry(entry) || entry.customMetadata?.resourcetype === '<collection />';
+}
+
+// Lists the members of the collection at `prefix` (all descendants when
+// `isRecursive`), including implicit directories. Non-recursive listings get
+// them from `delimitedPrefixes`; recursive listings synthesize the ancestor
+// directories of every key. Deduplication against explicit markers relies on
+// R2's lexicographic list order: a marker key ("a/b") always sorts before the
+// keys of its children ("a/b/..."), so it is recorded in `seenDirectories`
+// before anything could synthesize the same directory — even across pages.
+async function* listEntries(
+	bucket: R2Bucket,
+	prefix: string,
+	isRecursive: boolean = false,
+): AsyncGenerator<R2Object | DirectoryEntry> {
+	let seenDirectories = new Set<string>();
+	const directoryEntries = function* (directoryKey: string): Generator<DirectoryEntry> {
+		if (directoryKey + '/' !== prefix && !seenDirectories.has(directoryKey)) {
+			seenDirectories.add(directoryKey);
+			yield { kind: 'directory', key: directoryKey };
+		}
+	};
+
+	let cursor: string | undefined = undefined;
+	do {
+		var r2_objects = await bucket.list({
+			prefix: prefix,
+			delimiter: isRecursive ? undefined : '/',
+			cursor: cursor,
+			// @ts-ignore https://developers.cloudflare.com/r2/api/workers/workers-api-reference/#r2listoptions
+			include: ['httpMetadata', 'customMetadata'],
+		});
+
+		for (let object of r2_objects.objects) {
+			if (isRecursive) {
+				let segments = object.key.slice(prefix.length).split('/');
+				for (let index = 1; index < segments.length; index++) {
+					yield* directoryEntries(prefix + segments.slice(0, index).join('/'));
+				}
+			}
+			if (object.key.endsWith('/')) {
+				// Zero-byte "folder marker" convention used by some S3 clients.
+				yield* directoryEntries(object.key.slice(0, -1));
+				continue;
+			}
+			if (object.customMetadata?.resourcetype === '<collection />') {
+				seenDirectories.add(object.key);
+			}
+			yield object;
+		}
+		for (let delimitedPrefix of r2_objects.delimitedPrefixes) {
+			yield* directoryEntries(delimitedPrefix.slice(0, -1));
+		}
+
+		if (r2_objects.truncated) {
+			cursor = r2_objects.cursor;
+		}
+	} while (r2_objects.truncated);
+}
+
 type DavProperties = {
 	creationdate: string | undefined;
 	displayname: string | undefined;
@@ -229,13 +305,43 @@ function getParentPath(resourcePath: string): string {
 	return normalizedPath.split('/').slice(0, -1).join('/');
 }
 
+// True when the path is a directory that exists only as a key prefix of other
+// objects (no marker object of its own). The root always exists.
+async function hasImplicitDirectory(bucket: R2Bucket, resourcePath: string): Promise<boolean> {
+	if (resourcePath === '') {
+		return true;
+	}
+	let listed = await bucket.list({ prefix: resourcePath + '/', limit: 1 });
+	return listed.objects.length > 0;
+}
+
 async function hasCollectionResource(bucket: R2Bucket, resourcePath: string): Promise<boolean> {
 	if (resourcePath === '') {
 		return true;
 	}
 
 	let resource = await bucket.head(resourcePath);
-	return resource?.customMetadata?.resourcetype === '<collection />';
+	if (resource?.customMetadata?.resourcetype === '<collection />') {
+		return true;
+	}
+	return await hasImplicitDirectory(bucket, resourcePath);
+}
+
+// Maps a path to the resource it names: an R2 object (file or explicit
+// collection marker), a synthetic entry for the root or an implicit
+// directory, or null when nothing exists there.
+async function resolveResource(bucket: R2Bucket, resourcePath: string): Promise<R2Object | DirectoryEntry | null> {
+	if (resourcePath === '') {
+		return { kind: 'directory', key: '' };
+	}
+	let object = await bucket.head(resourcePath);
+	if (object !== null) {
+		return object;
+	}
+	if (await hasImplicitDirectory(bucket, resourcePath)) {
+		return { kind: 'directory', key: resourcePath };
+	}
+	return null;
 }
 
 function parseDestinationPath(destinationHeader: string, requestUrl: string): string | null {
@@ -755,23 +861,26 @@ function parseLockRequest(
 	return { scope, hasWriteType, owner };
 }
 
-function fromR2Object(object: R2Object | null | undefined): DavProperties {
-	if (object === null || object === undefined) {
-		return {
-			// RFC 4918 section 15.1: creationdate is an ISO 8601 date-time.
-			creationdate: new Date().toISOString(),
-			displayname: undefined,
-			getcontentlanguage: undefined,
-			getcontentlength: '0',
-			getcontenttype: undefined,
-			getetag: undefined,
-			getlastmodified: new Date().toUTCString(),
-			resourcetype: '<collection />',
-			supportedlock: getSupportedLock(),
-			lockdiscovery: '',
-		};
-	}
+// Properties for a collection with no backing object: the bucket root and
+// implicit directories. R2 stores nothing for them, so timestamps fall back
+// to the current time.
+function directoryDavProperties(): DavProperties {
+	return {
+		// RFC 4918 section 15.1: creationdate is an ISO 8601 date-time.
+		creationdate: new Date().toISOString(),
+		displayname: undefined,
+		getcontentlanguage: undefined,
+		getcontentlength: '0',
+		getcontenttype: undefined,
+		getetag: undefined,
+		getlastmodified: new Date().toUTCString(),
+		resourcetype: '<collection />',
+		supportedlock: getSupportedLock(),
+		lockdiscovery: '',
+	};
+}
 
+function fromR2Object(object: R2Object): DavProperties {
 	let isCollection = object.customMetadata?.resourcetype === '<collection />';
 	let lockDetails = getLockDetails(object.customMetadata);
 	return {
@@ -799,11 +908,15 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	};
 }
 
-function getLivePropertyValue(object: R2Object | null, property: DeadProperty): string | undefined {
+function fromEntry(entry: R2Object | DirectoryEntry): DavProperties {
+	return isDirectoryEntry(entry) ? directoryDavProperties() : fromR2Object(entry);
+}
+
+function getLivePropertyValue(entry: R2Object | DirectoryEntry, property: DeadProperty): string | undefined {
 	if (property.namespaceURI !== DAV_NAMESPACE) {
 		return undefined;
 	}
-	return fromR2Object(object)[property.localName as keyof DavProperties];
+	return fromEntry(entry)[property.localName as keyof DavProperties];
 }
 
 function renderPropstat(status: string, properties: string[]): string {
@@ -902,6 +1015,115 @@ async function findMatchingLock(
 	return null;
 }
 
+function formatFileSize(size: number): string {
+	let units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+	let index = 0;
+	while (size >= 1024 && index < units.length - 1) {
+		size /= 1024;
+		index++;
+	}
+	return `${index === 0 ? size : size.toFixed(1)} ${units[index]}`;
+}
+
+// Directories are served under their trailing-slash URL so that relative
+// links in the listing resolve correctly.
+function redirectToCollection(resourcePath: string): Response {
+	return new Response(null, {
+		status: 301,
+		headers: { Location: getResourceHref(resourcePath, true) },
+	});
+}
+
+async function renderDirectoryListing(bucket: R2Bucket, resource_path: string): Promise<Response> {
+	let prefix = resource_path === '' ? '' : resource_path + '/';
+
+	type ListingRow = { name: string; href: string; isDirectory: boolean; size: string; uploaded: string };
+	let rows: ListingRow[] = [];
+	for await (let entry of listEntries(bucket, prefix)) {
+		let isDirectory = isCollectionEntry(entry);
+		rows.push({
+			name: entry.key.slice(prefix.length) + (isDirectory ? '/' : ''),
+			href: getResourceHref(entry.key, isDirectory),
+			isDirectory,
+			size: isDirectory || isDirectoryEntry(entry) ? '' : formatFileSize(entry.size),
+			uploaded: isDirectoryEntry(entry) ? '' : entry.uploaded.toISOString().replace('T', ' ').slice(0, 19) + ' UTC',
+		});
+	}
+	rows.sort((left, right) =>
+		left.isDirectory !== right.isDirectory ? (left.isDirectory ? -1 : 1) : left.name.localeCompare(right.name),
+	);
+	if (resource_path !== '') {
+		rows.unshift({
+			name: '../',
+			href: getResourceHref(getParentPath(resource_path), true),
+			isDirectory: true,
+			size: '',
+			uploaded: '',
+		});
+	}
+
+	let breadcrumbs = `<a href="/">root</a>`;
+	let ancestorPath = '';
+	for (let segment of resource_path === '' ? [] : resource_path.split('/')) {
+		ancestorPath = ancestorPath === '' ? segment : `${ancestorPath}/${segment}`;
+		breadcrumbs += ` / <a href="${escapeXml(getResourceHref(ancestorPath, true))}">${escapeXml(segment)}</a>`;
+	}
+
+	let listing = rows
+		.map(
+			(row) =>
+				`<tr><td><a class="${row.isDirectory ? 'dir' : 'file'}" href="${escapeXml(row.href)}">${escapeXml(row.name)}</a></td><td class="size">${escapeXml(row.size)}</td><td class="modified">${escapeXml(row.uploaded)}</td></tr>`,
+		)
+		.join('\n');
+	if (listing === '') {
+		listing = '<tr><td class="empty" colspan="3">This directory is empty.</td></tr>';
+	}
+
+	let pageSource = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>R2 Storage — /${escapeXml(resource_path)}</title>
+<style>
+*{box-sizing:border-box;}
+body{margin:0;padding:24px;font-family:'Segoe UI','Roboto','Helvetica Neue',sans-serif;background:#f8fafc;color:#1e293b;}
+h1{font-size:20px;margin:0 0 16px;}
+.breadcrumbs{margin-bottom:16px;font-size:14px;color:#64748b;word-break:break-all;}
+.breadcrumbs a{color:#2563eb;text-decoration:none;}
+.breadcrumbs a:hover{text-decoration:underline;}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;}
+th{text-align:left;padding:8px 12px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#64748b;background:#f1f5f9;border-bottom:1px solid #e2e8f0;}
+td{padding:6px 12px;font-size:14px;border-bottom:1px solid #f1f5f9;}
+tr:last-child td{border-bottom:none;}
+tr:hover td{background:#f8fafc;}
+td a{display:block;color:#1e293b;text-decoration:none;word-break:break-all;}
+td a:hover{color:#2563eb;}
+td a.dir{font-weight:600;}
+td a.dir::before{content:'📁 ';}
+td a.file::before{content:'📄 ';}
+td.size,td.modified{width:1%;text-align:right;color:#64748b;white-space:nowrap;}
+td.empty{padding:32px;text-align:center;color:#94a3b8;}
+</style>
+</head>
+<body>
+<h1>R2 Storage</h1>
+<div class="breadcrumbs">${breadcrumbs}</div>
+<table>
+<thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
+<tbody>
+${listing}
+</tbody>
+</table>
+</body>
+</html>`;
+
+	return new Response(pageSource, {
+		status: 200,
+		headers: { 'Content-Type': 'text/html; charset=utf-8' },
+	});
+}
+
 async function handle_head(request: Request, bucket: R2Bucket): Promise<Response> {
 	let response = await handle_get(request, bucket);
 	return new Response(null, {
@@ -914,37 +1136,12 @@ async function handle_head(request: Request, bucket: R2Bucket): Promise<Response
 async function handle_get(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
 
-	if (request.url.endsWith('/')) {
-		if (resource_path !== '') {
-			let resource = await bucket.head(resource_path);
-			if (resource === null || resource.customMetadata?.resourcetype !== '<collection />') {
-				return new Response('Not Found', { status: 404 });
-			}
+	if (new URL(request.url).pathname.endsWith('/')) {
+		let entry = await resolveResource(bucket, resource_path);
+		if (entry === null || !isCollectionEntry(entry)) {
+			return new Response('Not Found', { status: 404 });
 		}
-
-		let page = '',
-			prefix = resource_path;
-		if (resource_path !== '') {
-			page += `<a href="../">..</a><br>`;
-			prefix = `${resource_path}/`;
-		}
-
-		for await (const object of listAll(bucket, prefix)) {
-			if (object.key === resource_path) {
-				continue;
-			}
-			let href = getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />');
-			page += `<a href="${escapeXml(href)}">${escapeXml(
-				object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length),
-			)}</a><br>`;
-		}
-		// 定义模板
-		var pageSource = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>R2Storage</title><style>*{box-sizing:border-box;}body{padding:10px;font-family:'Segoe UI','Circular','Roboto','Lato','Helvetica Neue','Arial Rounded MT Bold','sans-serif';}a{display:inline-block;width:100%;color:#000;text-decoration:none;padding:5px 10px;cursor:pointer;border-radius:5px;}a:hover{background-color:#60C590;color:white;}a[href="../"]{background-color:#cbd5e1;}</style></head><body><h1>R2 Storage</h1><div>${page}</div></body></html>`;
-
-		return new Response(pageSource, {
-			status: 200,
-			headers: { 'Content-Type': 'text/html; charset=utf-8' },
-		});
+		return await renderDirectoryListing(bucket, resource_path);
 	} else {
 		let object = await bucket.get(resource_path, {
 			range: request.headers,
@@ -955,7 +1152,13 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 		};
 
 		if (object === null) {
+			if (await hasImplicitDirectory(bucket, resource_path)) {
+				return redirectToCollection(resource_path);
+			}
 			return new Response('Not Found', { status: 404 });
+		}
+		if (object.customMetadata?.resourcetype === '<collection />') {
+			return redirectToCollection(resource_path);
 		}
 
 		let preconditionStatus = checkPreconditions(request, object);
@@ -1045,12 +1248,8 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 	let existing = await bucket.head(resource_path);
 
 	// Check if the parent directory exists
-	let dirpath = getParentPath(resource_path);
-	if (dirpath !== '') {
-		let dir = await bucket.head(dirpath);
-		if (!(dir && dir.customMetadata?.resourcetype === '<collection />')) {
-			return new Response('Conflict', { status: 409 });
-		}
+	if (!(await hasCollectionResource(bucket, getParentPath(resource_path)))) {
+		return new Response('Conflict', { status: 409 });
 	}
 
 	// Evaluate HTTP preconditions explicitly. Passing `request.headers` as
@@ -1078,45 +1277,12 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 		: new Response(null, { status: 204, headers: responseHeaders });
 }
 
-async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
-	let lockResponse = await assertRecursiveDeletePermission(request, bucket, resource_path);
-	if (lockResponse !== null) {
-		return lockResponse;
-	}
-
-	if (resource_path === '') {
-		let r2_objects,
-			cursor: string | undefined = undefined;
-		do {
-			r2_objects = await bucket.list({ cursor: cursor });
-			let keys = r2_objects.objects.map((object) => object.key);
-			if (keys.length > 0) {
-				await bucket.delete(keys);
-			}
-
-			if (r2_objects.truncated) {
-				cursor = r2_objects.cursor;
-			}
-		} while (r2_objects.truncated);
-
-		return new Response(null, { status: 204 });
-	}
-
-	let resource = await bucket.head(resource_path);
-	if (resource === null) {
-		return new Response('Not Found', { status: 404 });
-	}
-	if (resource.customMetadata?.resourcetype !== '<collection />') {
-		await bucket.delete(resource_path);
-		return new Response(null, { status: 204 });
-	}
-
+async function deleteAllWithPrefix(bucket: R2Bucket, prefix: string): Promise<void> {
 	let r2_objects,
 		cursor: string | undefined = undefined;
 	do {
 		r2_objects = await bucket.list({
-			prefix: resource_path + '/',
+			prefix: prefix,
 			cursor: cursor,
 		});
 		let keys = r2_objects.objects.map((object) => object.key);
@@ -1128,7 +1294,34 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 			cursor = r2_objects.cursor;
 		}
 	} while (r2_objects.truncated);
+}
 
+async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
+	let lockResponse = await assertRecursiveDeletePermission(request, bucket, resource_path);
+	if (lockResponse !== null) {
+		return lockResponse;
+	}
+
+	if (resource_path === '') {
+		await deleteAllWithPrefix(bucket, '');
+		return new Response(null, { status: 204 });
+	}
+
+	let resource = await bucket.head(resource_path);
+	if (resource === null) {
+		if (!(await hasImplicitDirectory(bucket, resource_path))) {
+			return new Response('Not Found', { status: 404 });
+		}
+		await deleteAllWithPrefix(bucket, resource_path + '/');
+		return new Response(null, { status: 204 });
+	}
+	if (resource.customMetadata?.resourcetype !== '<collection />') {
+		await bucket.delete(resource_path);
+		return new Response(null, { status: 204 });
+	}
+
+	await deleteAllWithPrefix(bucket, resource_path + '/');
 	await bucket.delete(resource_path);
 	return new Response(null, { status: 204 });
 }
@@ -1144,9 +1337,9 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 		return lockResponse;
 	}
 
-	// Check if the resource already exists
+	// Check if the resource already exists (as an object or an implicit directory)
 	let resource = await bucket.head(resource_path);
-	if (resource !== null) {
+	if (resource !== null || (await hasImplicitDirectory(bucket, resource_path))) {
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
@@ -1163,11 +1356,11 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	return new Response('', { status: 201 });
 }
 
-function generate_propfind_response(object: R2Object | null, propfindRequest: PropfindRequest): string {
-	let href =
-		object === null ? '/' : getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />');
-	let deadProperties = getDeadProperties(object?.customMetadata);
-	let liveProperties = Object.entries(fromR2Object(object)).flatMap(([key, value]) =>
+function generate_propfind_response(entry: R2Object | DirectoryEntry, propfindRequest: PropfindRequest): string {
+	let href = getResourceHref(entry.key, isCollectionEntry(entry));
+	let customMetadata = isDirectoryEntry(entry) ? undefined : entry.customMetadata;
+	let deadProperties = getDeadProperties(customMetadata);
+	let liveProperties = Object.entries(fromEntry(entry)).flatMap(([key, value]) =>
 		value === undefined ? [] : [renderDavProperty(key, value)],
 	);
 
@@ -1181,7 +1374,7 @@ function generate_propfind_response(object: R2Object | null, propfindRequest: Pr
 		}
 		case 'propname': {
 			okProperties = [
-				...Object.entries(fromR2Object(object)).flatMap(([key, value]) =>
+				...Object.entries(fromEntry(entry)).flatMap(([key, value]) =>
 					value === undefined ? [] : [renderDavProperty(key, '')],
 				),
 				...deadProperties.map((property) => renderEmptyPropertyElement({ ...property, valueXml: '' })),
@@ -1190,12 +1383,12 @@ function generate_propfind_response(object: R2Object | null, propfindRequest: Pr
 		}
 		case 'prop': {
 			for (const property of propfindRequest.properties) {
-				let liveValue = getLivePropertyValue(object, property);
+				let liveValue = getLivePropertyValue(entry, property);
 				if (liveValue !== undefined) {
 					okProperties.push(renderDavProperty(property.localName, liveValue));
 					continue;
 				}
-				let deadProperty = getDeadProperty(object?.customMetadata, property.namespaceURI, property.localName);
+				let deadProperty = getDeadProperty(customMetadata, property.namespaceURI, property.localName);
 				if (deadProperty !== null) {
 					okProperties.push(renderPropertyElement(deadProperty));
 				} else {
@@ -1219,23 +1412,16 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 		return new Response('Bad Request', { status: 400 });
 	}
 
-	let is_collection: boolean;
 	let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
 
-	if (resource_path === '') {
-		page += generate_propfind_response(null, propfindRequest);
-		is_collection = true;
-	} else {
-		let object = await bucket.head(resource_path);
-		if (object === null) {
-			return new Response('Not Found', { status: 404 });
-		}
-		is_collection = object.customMetadata?.resourcetype === '<collection />';
-		page += generate_propfind_response(object, propfindRequest);
+	let entry = await resolveResource(bucket, resource_path);
+	if (entry === null) {
+		return new Response('Not Found', { status: 404 });
 	}
+	page += generate_propfind_response(entry, propfindRequest);
 
-	if (is_collection) {
+	if (isCollectionEntry(entry)) {
 		let depth = request.headers.get('Depth') ?? 'infinity';
 		switch (depth) {
 			case '0':
@@ -1243,16 +1429,16 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 			case '1':
 				{
 					let prefix = resource_path === '' ? resource_path : resource_path + '/';
-					for await (let object of listAll(bucket, prefix)) {
-						page += generate_propfind_response(object, propfindRequest);
+					for await (let member of listEntries(bucket, prefix)) {
+						page += generate_propfind_response(member, propfindRequest);
 					}
 				}
 				break;
 			case 'infinity':
 				{
 					let prefix = resource_path === '' ? resource_path : resource_path + '/';
-					for await (let object of listAll(bucket, prefix, true)) {
-						page += generate_propfind_response(object, propfindRequest);
+					for await (let member of listEntries(bucket, prefix, true)) {
+						page += generate_propfind_response(member, propfindRequest);
 					}
 				}
 				break;
@@ -1280,6 +1466,14 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 
 	// 检查资源是否存在
 	let object = await bucket.head(resource_path);
+	if (object === null && resource_path !== '' && (await hasImplicitDirectory(bucket, resource_path))) {
+		// Materialize the implicit directory as an explicit marker so the
+		// properties have an object to live on.
+		await bucket.put(resource_path, new Uint8Array(), {
+			customMetadata: { resourcetype: '<collection />' },
+		});
+		object = await bucket.head(resource_path);
+	}
 	if (object === null) {
 		return new Response('Not Found', { status: 404 });
 	}
@@ -1403,11 +1597,14 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	}
 
 	let resource = await bucket.head(resource_path);
-	if (resource === null) {
+	let is_dir: boolean;
+	if (resource !== null) {
+		is_dir = resource.customMetadata?.resourcetype === '<collection />';
+	} else if (await hasImplicitDirectory(bucket, resource_path)) {
+		is_dir = true;
+	} else {
 		return new Response('Not Found', { status: 404 });
 	}
-
-	let is_dir = resource?.customMetadata?.resourcetype === '<collection />';
 
 	if (is_dir) {
 		let depth = request.headers.get('Depth') ?? 'infinity';
@@ -1425,7 +1622,8 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 						});
 					}
 				};
-				let promise_array = [copy(resource)];
+				// An implicit directory has no marker object of its own to copy.
+				let promise_array = resource === null ? [] : [copy(resource)];
 				for await (let object of listAll(bucket, prefix, true)) {
 					promise_array.push(copy(object));
 				}
@@ -1437,14 +1635,22 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 				}
 			}
 			case '0': {
-				let object = await bucket.get(resource.key);
-				if (object === null) {
-					return new Response('Not Found', { status: 404 });
+				if (resource === null) {
+					// Depth 0 copies the collection without members; materialize it
+					// as an explicit marker at the destination.
+					await bucket.put(destination, new Uint8Array(), {
+						customMetadata: { resourcetype: '<collection />' },
+					});
+				} else {
+					let object = await bucket.get(resource.key);
+					if (object === null) {
+						return new Response('Not Found', { status: 404 });
+					}
+					await bucket.put(destination, object.body, {
+						httpMetadata: object.httpMetadata,
+						customMetadata: stripLockMetadata(object.customMetadata),
+					});
 				}
-				await bucket.put(destination, object.body, {
-					httpMetadata: object.httpMetadata,
-					customMetadata: stripLockMetadata(object.customMetadata),
-				});
 				if (destination_exists) {
 					return new Response(null, { status: 204 });
 				} else {
@@ -1456,7 +1662,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 			}
 		}
 	} else {
-		let src = await bucket.get(resource.key);
+		let src = await bucket.get(resource_path);
 		if (src === null) {
 			return new Response('Not Found', { status: 404 });
 		}
@@ -1508,11 +1714,13 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	}
 
 	let resource = await bucket.head(resource_path);
-	if (resource === null) {
+	let is_dir: boolean;
+	if (resource !== null) {
+		is_dir = resource.customMetadata?.resourcetype === '<collection />';
+	} else if (await hasImplicitDirectory(bucket, resource_path)) {
+		is_dir = true;
+	} else {
 		return new Response('Not Found', { status: 404 });
-	}
-	if (resource.key === destination) {
-		return new Response('Bad Request', { status: 400 });
 	}
 
 	if (destination_exists) {
@@ -1536,8 +1744,6 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 		}
 	}
 
-	let is_dir = resource?.customMetadata?.resourcetype === '<collection />';
-
 	if (is_dir) {
 		let depth = request.headers.get('Depth') ?? 'infinity';
 		switch (depth) {
@@ -1555,7 +1761,8 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 						await bucket.delete(object.key);
 					}
 				};
-				let promise_array = [move(resource)];
+				// An implicit directory has no marker object of its own to move.
+				let promise_array = resource === null ? [] : [move(resource)];
 				for await (let object of listAll(bucket, prefix, true)) {
 					promise_array.push(move(object));
 				}
@@ -1571,7 +1778,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 			}
 		}
 	} else {
-		let src = await bucket.get(resource.key);
+		let src = await bucket.get(resource_path);
 		if (src === null) {
 			return new Response('Not Found', { status: 404 });
 		}
@@ -1579,7 +1786,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 			httpMetadata: src.httpMetadata,
 			customMetadata: getPreservedCustomMetadata(src.customMetadata),
 		});
-		await bucket.delete(resource.key);
+		await bucket.delete(resource_path);
 		if (destination_exists) {
 			return new Response(null, { status: 204 });
 		} else {
@@ -1628,15 +1835,21 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 		if (body === '') {
 			return new Response('Bad Request', { status: 400 });
 		}
-		if (!(await hasCollectionResource(bucket, getParentPath(resource_path)))) {
-			return new Response('Conflict', { status: 409 });
-		}
-		if (request.url.endsWith('/')) {
-			return new Response('Conflict', { status: 409 });
+		let isImplicitDirectory = resource_path !== '' && (await hasImplicitDirectory(bucket, resource_path));
+		if (!isImplicitDirectory) {
+			if (!(await hasCollectionResource(bucket, getParentPath(resource_path)))) {
+				return new Response('Conflict', { status: 409 });
+			}
+			if (request.url.endsWith('/')) {
+				return new Response('Conflict', { status: 409 });
+			}
 		}
 
+		// Locking an implicit directory materializes its collection marker so
+		// the lock metadata has an object to live on; otherwise this creates
+		// the empty lock-null resource of RFC 4918 section 7.3.
 		await bucket.put(resource_path, new Uint8Array(), {
-			customMetadata: {},
+			customMetadata: isImplicitDirectory ? { resourcetype: '<collection />' } : {},
 		});
 		resource = await bucket.head(resource_path);
 		currentLocks = [];
@@ -1885,4 +2098,3 @@ export default {
 		return response;
 	},
 };
-
