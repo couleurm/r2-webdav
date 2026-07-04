@@ -36,12 +36,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y litmus
 
-      - name: Configure development credentials
+      - name: Seed test user in local KV
         run: |
-          cat <<EOF > .dev.vars
-          USERNAME=${TEST_USERNAME}
-          PASSWORD=${TEST_PASSWORD}
-          EOF
+          npx wrangler kv key put "user:${TEST_USERNAME}" "{\"password\":\"${TEST_PASSWORD}\"}" --binding=users --local
 
       - name: Start Wrangler
         run: |

@@ -14,12 +14,108 @@ export interface Env {
 	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
 	bucket: R2Bucket;
 
-	// Variables defined in the "Environment Variables" section of the Wrangler CLI or dashboard
-	USERNAME: string;
-	PASSWORD: string;
+	// KV namespace holding WebDAV accounts: key `user:<username>`, value
+	// `{"password":"..."}`. Seeded directly by admins; there is no
+	// registration or admin UI.
+	users: KVNamespace;
 }
 
-async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean = false) {
+// The subset of the R2 bucket API the WebDAV handlers use. Satisfied both by
+// the raw R2Bucket binding (anonymous web mode) and by ScopedBucket
+// (authenticated per-user mounts).
+interface DavBucket {
+	head(key: string): Promise<R2Object | null>;
+	get(key: string, options?: R2GetOptions): Promise<R2ObjectBody | null>;
+	put(
+		key: string,
+		value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob,
+		options?: R2PutOptions,
+	): Promise<R2Object>;
+	delete(keys: string | string[]): Promise<void>;
+	list(options?: R2ListOptions): Promise<R2Objects>;
+}
+
+// Jails every bucket operation under `<username>/` by translating keys at the
+// R2 boundary: user foo's `/` is the bucket prefix `foo/`. The WebDAV handlers
+// above only ever see unprefixed keys, so hrefs, Location headers, and
+// Destination parsing all come out mount-relative, and no key a user can
+// produce (including `..` tricks, which are resolved before this layer)
+// escapes the prefix.
+class ScopedBucket implements DavBucket {
+	constructor(
+		private bucket: DavBucket,
+		private prefix: string, // '<username>/'
+	) {}
+
+	private scopeKey(key: string): string {
+		return this.prefix + key;
+	}
+
+	private stripKey(key: string): string {
+		return key.slice(this.prefix.length);
+	}
+
+	// R2Object.key is read-only, so the unprefixed key is exposed through a
+	// proxy; everything else (getters like `body`, methods like
+	// `writeHttpMetadata`) delegates to the underlying native object.
+	private stripObject<ObjectType extends R2Object>(object: ObjectType): ObjectType;
+	private stripObject<ObjectType extends R2Object>(object: ObjectType | null): ObjectType | null;
+	private stripObject<ObjectType extends R2Object>(object: ObjectType | null): ObjectType | null {
+		if (object === null) {
+			return null;
+		}
+		let strippedKey = this.stripKey(object.key);
+		return new Proxy(object, {
+			get(target, property) {
+				if (property === 'key') {
+					return strippedKey;
+				}
+				let value = Reflect.get(target, property, target);
+				return typeof value === 'function' ? value.bind(target) : value;
+			},
+		});
+	}
+
+	async head(key: string): Promise<R2Object | null> {
+		return this.stripObject(await this.bucket.head(this.scopeKey(key)));
+	}
+
+	async get(key: string, options?: R2GetOptions): Promise<R2ObjectBody | null> {
+		return this.stripObject(await this.bucket.get(this.scopeKey(key), options));
+	}
+
+	async put(
+		key: string,
+		value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob,
+		options?: R2PutOptions,
+	): Promise<R2Object> {
+		return this.stripObject(await this.bucket.put(this.scopeKey(key), value, options));
+	}
+
+	async delete(keys: string | string[]): Promise<void> {
+		await this.bucket.delete(Array.isArray(keys) ? keys.map((key) => this.scopeKey(key)) : this.scopeKey(keys));
+	}
+
+	async list(options?: R2ListOptions): Promise<R2Objects> {
+		let listed = await this.bucket.list({
+			...options,
+			prefix: this.prefix + (options?.prefix ?? ''),
+		});
+		// An S3-style folder marker for the home directory itself (an object
+		// whose key is exactly `<username>/`) would strip to '', i.e. the mount
+		// root — never a member of any listing. Hiding it here also keeps
+		// `DELETE /` from removing the mount point's marker.
+		let objects = listed.objects
+			.filter((object) => object.key !== this.prefix)
+			.map((object) => this.stripObject(object));
+		let delimitedPrefixes = listed.delimitedPrefixes.map((delimitedPrefix) => this.stripKey(delimitedPrefix));
+		return listed.truncated
+			? { objects, delimitedPrefixes, truncated: true, cursor: listed.cursor }
+			: { objects, delimitedPrefixes, truncated: false };
+	}
+}
+
+async function* listAll(bucket: DavBucket, prefix: string, isRecursive: boolean = false) {
 	let cursor: string | undefined = undefined;
 	do {
 		var r2_objects = await bucket.list({
@@ -67,7 +163,7 @@ function isCollectionEntry(entry: R2Object | DirectoryEntry): boolean {
 // keys of its children ("a/b/..."), so it is recorded in `seenDirectories`
 // before anything could synthesize the same directory — even across pages.
 async function* listEntries(
-	bucket: R2Bucket,
+	bucket: DavBucket,
 	prefix: string,
 	isRecursive: boolean = false,
 ): AsyncGenerator<R2Object | DirectoryEntry> {
@@ -307,7 +403,7 @@ function getParentPath(resourcePath: string): string {
 
 // True when the path is a directory that exists only as a key prefix of other
 // objects (no marker object of its own). The root always exists.
-async function hasImplicitDirectory(bucket: R2Bucket, resourcePath: string): Promise<boolean> {
+async function hasImplicitDirectory(bucket: DavBucket, resourcePath: string): Promise<boolean> {
 	if (resourcePath === '') {
 		return true;
 	}
@@ -315,7 +411,7 @@ async function hasImplicitDirectory(bucket: R2Bucket, resourcePath: string): Pro
 	return listed.objects.length > 0;
 }
 
-async function hasCollectionResource(bucket: R2Bucket, resourcePath: string): Promise<boolean> {
+async function hasCollectionResource(bucket: DavBucket, resourcePath: string): Promise<boolean> {
 	if (resourcePath === '') {
 		return true;
 	}
@@ -330,7 +426,7 @@ async function hasCollectionResource(bucket: R2Bucket, resourcePath: string): Pr
 // Maps a path to the resource it names: an R2 object (file or explicit
 // collection marker), a synthetic entry for the root or an implicit
 // directory, or null when nothing exists there.
-async function resolveResource(bucket: R2Bucket, resourcePath: string): Promise<R2Object | DirectoryEntry | null> {
+async function resolveResource(bucket: DavBucket, resourcePath: string): Promise<R2Object | DirectoryEntry | null> {
 	if (resourcePath === '') {
 		return { kind: 'directory', key: '' };
 	}
@@ -745,7 +841,7 @@ function parseIfHeader(ifHeader: string): IfHeaderList[] {
 // the Request-URI resource). A state-token condition holds when the resource
 // is covered by a lock with that token; an entity-tag condition holds when
 // the resource's current etag matches.
-async function evaluateIfHeader(request: Request, bucket: R2Bucket): Promise<boolean> {
+async function evaluateIfHeader(request: Request, bucket: DavBucket): Promise<boolean> {
 	let ifHeader = request.headers.get('If');
 	if (ifHeader === null) {
 		return true;
@@ -938,7 +1034,7 @@ function make_resource_path(request: Request): string {
 
 async function assertLockPermission(
 	request: Request,
-	bucket: R2Bucket,
+	bucket: DavBucket,
 	resourcePath: string,
 	options: { ignoreSharedLocksOnTarget?: boolean } = {},
 ): Promise<Response | null> {
@@ -973,7 +1069,7 @@ async function assertLockPermission(
 
 async function assertRecursiveDeletePermission(
 	request: Request,
-	bucket: R2Bucket,
+	bucket: DavBucket,
 	resourcePath: string,
 ): Promise<Response | null> {
 	let lockResponse = await assertLockPermission(request, bucket, resourcePath);
@@ -995,7 +1091,7 @@ async function assertRecursiveDeletePermission(
 
 async function findMatchingLock(
 	request: Request,
-	bucket: R2Bucket,
+	bucket: DavBucket,
 	resourcePath: string,
 ): Promise<{ resource: R2Object; lockDetails: LockDetails } | null> {
 	let lockTokens = getRequestLockTokens(request);
@@ -1034,7 +1130,7 @@ function redirectToCollection(resourcePath: string): Response {
 	});
 }
 
-async function renderDirectoryListing(bucket: R2Bucket, resource_path: string): Promise<Response> {
+async function renderDirectoryListing(bucket: DavBucket, resource_path: string): Promise<Response> {
 	let prefix = resource_path === '' ? '' : resource_path + '/';
 
 	type ListingRow = { name: string; href: string; isDirectory: boolean; size: string; uploaded: string };
@@ -1124,7 +1220,7 @@ ${listing}
 	});
 }
 
-async function handle_head(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_head(request: Request, bucket: DavBucket): Promise<Response> {
 	let response = await handle_get(request, bucket);
 	return new Response(null, {
 		status: response.status,
@@ -1133,7 +1229,7 @@ async function handle_head(request: Request, bucket: R2Bucket): Promise<Response
 	});
 }
 
-async function handle_get(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_get(request: Request, bucket: DavBucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
 
 	if (new URL(request.url).pathname.endsWith('/')) {
@@ -1235,7 +1331,7 @@ function calcContentRange(object: R2ObjectBody) {
 	return { rangeOffset, rangeEnd };
 }
 
-async function handle_put(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_put(request: Request, bucket: DavBucket): Promise<Response> {
 	if (request.url.endsWith('/')) {
 		return new Response('Method Not Allowed', { status: 405 });
 	}
@@ -1277,7 +1373,7 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 		: new Response(null, { status: 204, headers: responseHeaders });
 }
 
-async function deleteAllWithPrefix(bucket: R2Bucket, prefix: string): Promise<void> {
+async function deleteAllWithPrefix(bucket: DavBucket, prefix: string): Promise<void> {
 	let r2_objects,
 		cursor: string | undefined = undefined;
 	do {
@@ -1296,7 +1392,7 @@ async function deleteAllWithPrefix(bucket: R2Bucket, prefix: string): Promise<vo
 	} while (r2_objects.truncated);
 }
 
-async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_delete(request: Request, bucket: DavBucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
 	let lockResponse = await assertRecursiveDeletePermission(request, bucket, resource_path);
 	if (lockResponse !== null) {
@@ -1326,7 +1422,7 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 	return new Response(null, { status: 204 });
 }
 
-async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_mkcol(request: Request, bucket: DavBucket): Promise<Response> {
 	if ((await request.clone().arrayBuffer()).byteLength > 0) {
 		return new Response('Unsupported Media Type', { status: 415 });
 	}
@@ -1405,7 +1501,7 @@ function generate_propfind_response(entry: R2Object | DirectoryEntry, propfindRe
 	</response>`;
 }
 
-async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_propfind(request: Request, bucket: DavBucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
 	let propfindRequest = parsePropfindRequest(await request.text());
 	if (propfindRequest === null) {
@@ -1457,7 +1553,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 	});
 }
 
-async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_proppatch(request: Request, bucket: DavBucket): Promise<Response> {
 	const resource_path = make_resource_path(request);
 	let lockResponse = await assertLockPermission(request, bucket, resource_path);
 	if (lockResponse !== null) {
@@ -1565,7 +1661,7 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 	});
 }
 
-async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_copy(request: Request, bucket: DavBucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
 	let dont_overwrite = request.headers.get('Overwrite') === 'F';
 	let destination_header = request.headers.get('Destination');
@@ -1678,7 +1774,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	}
 }
 
-async function handle_move(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_move(request: Request, bucket: DavBucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
 	let overwrite = (request.headers.get('Overwrite') ?? 'T') !== 'F';
 	let destination_header = request.headers.get('Destination');
@@ -1795,7 +1891,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	}
 }
 
-async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_lock(request: Request, bucket: DavBucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
 	let depthHeader = request.headers.get('Depth');
 	if (depthHeader !== null && !VALID_LOCK_DEPTHS.includes(depthHeader as (typeof VALID_LOCK_DEPTHS)[number])) {
@@ -1920,7 +2016,7 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 	);
 }
 
-async function handle_unlock(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_unlock(request: Request, bucket: DavBucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
 	let resource = await bucket.head(resource_path);
 	if (resource === null) {
@@ -1974,7 +2070,7 @@ const SUPPORT_METHODS = [
 	'UNLOCK',
 ];
 
-async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Response> {
+async function dispatch_handler(request: Request, bucket: DavBucket): Promise<Response> {
 	switch (request.method) {
 		case 'OPTIONS': {
 			return new Response(null, {
@@ -2034,32 +2130,92 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 	}
 }
 
-function is_authorized(authorization_header: string, username: string, password: string): boolean {
+type UserRecord = {
+	password: string;
+};
+
+function isValidUsername(username: string): boolean {
+	return (
+		username.length > 0 && username.length <= 128 && !username.includes('/') && username !== '.' && username !== '..'
+	);
+}
+
+// Resolves Basic credentials against the `users` KV namespace. Returns the
+// username, or null when the header is absent or malformed, the user is
+// unknown (including a completely unseeded namespace), the stored value is
+// not valid JSON, or the password does not match.
+async function authenticate(request: Request, users: KVNamespace): Promise<string | null> {
+	let header = request.headers.get('Authorization');
+	if (header === null) {
+		return null;
+	}
+	let encoded = header.match(/^Basic\s+(.+)$/i)?.[1];
+	if (encoded === undefined) {
+		return null;
+	}
+	let credentials: string;
+	try {
+		credentials = atob(encoded.trim());
+	} catch {
+		return null;
+	}
+	// Split at the first colon only: passwords may contain colons.
+	let separator = credentials.indexOf(':');
+	if (separator === -1) {
+		return null;
+	}
+	let username = credentials.slice(0, separator);
+	let password = credentials.slice(separator + 1);
+	if (!isValidUsername(username)) {
+		return null;
+	}
+
+	let record: UserRecord | null;
+	try {
+		record = await users.get<UserRecord>(`user:${username}`, { type: 'json', cacheTtl: 60 });
+	} catch {
+		return null;
+	}
+	if (record === null || typeof record.password !== 'string') {
+		return null;
+	}
+
 	const encoder = new TextEncoder();
-
-	const header = encoder.encode(authorization_header);
-	const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
-
-	return timingSafeEqual(header, expected);
+	if (!timingSafeEqual(encoder.encode(password), encoder.encode(record.password))) {
+		return null;
+	}
+	return username;
 }
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const { bucket } = env;
-
-		if (
-			request.method !== 'OPTIONS' &&
-			!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)
-		) {
-			return new Response('Unauthorized', {
-				status: 401,
-				headers: {
-					'WWW-Authenticate': 'Basic realm="webdav"',
-				},
-			});
+		let response: Response;
+		if (request.method === 'OPTIONS') {
+			// Capability probe: static response, touches no data, so it needs no
+			// auth and no scope. MiniRedir sends it before offering credentials.
+			response = await dispatch_handler(request, env.bucket);
+		} else {
+			let username = await authenticate(request, env.users);
+			if (username !== null) {
+				// Authenticated WebDAV: `/` is mounted at `<username>/`.
+				response = await dispatch_handler(request, new ScopedBucket(env.bucket, username + '/'));
+			} else if (
+				request.headers.get('Authorization') === null &&
+				(request.method === 'GET' || request.method === 'HEAD')
+			) {
+				// Public web mode: anonymous read-only access to the whole bucket.
+				// Deliberately no WWW-Authenticate here — browsers must never be
+				// prompted to log in; auth exists only for WebDAV clients.
+				response = await dispatch_handler(request, env.bucket);
+			} else {
+				response = new Response('Unauthorized', {
+					status: 401,
+					headers: {
+						'WWW-Authenticate': 'Basic realm="webdav"',
+					},
+				});
+			}
 		}
-
-		let response: Response = await dispatch_handler(request, bucket);
 
 		// Set CORS headers
 		response.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') ?? '*');

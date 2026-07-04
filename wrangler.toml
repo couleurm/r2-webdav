@@ -10,6 +10,12 @@ compatibility_flags = ["nodejs_compat"]
 binding = "bucket" # <~ valid JavaScript variable name
 bucket_name = "webdav"
 
+# WebDAV accounts: key `user:<username>`, value `{"password":"..."}`.
+# Seed with: wrangler kv key put "user:foo" '{"password":"..."}' --binding=users --remote
+[[kv_namespaces]]
+binding = "users"
+id = "put a kv id here.."
+
 # Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/#enable-workers-logs
 [observability]
 enabled = true
