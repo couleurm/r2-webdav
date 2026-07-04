@@ -9,6 +9,7 @@
  */
 
 import { DOMParser } from '@xmldom/xmldom';
+import { marked } from 'marked';
 
 export interface Env {
 	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
@@ -336,6 +337,7 @@ const MIME_BY_EXT: Record<string, string> = {
 	pdf: 'application/pdf',
 	txt: 'text/plain',
 	md: 'text/markdown',
+	markdown: 'text/markdown',
 	csv: 'text/csv',
 	json: 'application/json',
 	xml: 'application/xml',
@@ -401,6 +403,11 @@ function resolveContentType(object: R2Object): string {
 		return stored as string;
 	}
 	return inferContentType(object.key) ?? 'application/octet-stream';
+}
+
+// type/subtype with parameters and casing stripped, for comparing MIME types.
+function baseMimeType(value: string): string {
+	return value.split(';')[0].trim().toLowerCase();
 }
 
 // Validates a user-supplied MIME string before it becomes a stored header
@@ -1359,7 +1366,7 @@ async function renderDirectoryListing(bucket: DavBucket, resource_path: string, 
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>R2 Storage — /${escapeXml(resource_path)}</title>
+<title>/${escapeXml(resource_path)}</title>
 <style>
 *{box-sizing:border-box;}
 body{margin:0;padding:24px;font-family:'Segoe UI','Roboto','Helvetica Neue',sans-serif;background:#f8fafc;color:#1e293b;}
@@ -1384,7 +1391,6 @@ td.empty{padding:32px;text-align:center;color:#94a3b8;}
 </style>
 </head>
 <body>
-<h1>R2 Storage</h1>
 <div class="breadcrumbs">${breadcrumbs}</div>
 <table>
 <thead><tr>${tableHeader}</tr></thead>
@@ -1401,8 +1407,94 @@ ${listing}
 	});
 }
 
-async function handle_head(request: Request, bucket: DavBucket): Promise<Response> {
-	let response = await handle_get(request, bucket);
+// Serves a text/markdown object converted to HTML (see the conversion rules in
+// handle_get). By default the converted fragment is wrapped in a minimal page
+// shell styled like the directory listing; `?bare=1` skips the shell and
+// returns just the fragment, for embedding (e.g. fetched by an SPA).
+//
+// Caching: the response reuses the source object's ETag/Last-Modified. The
+// converted view lives at its own URL (`?type=text/html`), so sharing the
+// ETag with the raw view is sound, and checkPreconditions has already run —
+// browser revalidation 304s before any conversion work happens.
+async function renderMarkdownDocument(
+	bucket: DavBucket,
+	resource_path: string,
+	object: R2ObjectBody,
+	url: URL,
+): Promise<Response> {
+	// A byte range of the markdown source is meaningless for the converted
+	// document: ignore the range (RFC 9110 allows this) and render the whole
+	// file, re-reading it if the ranged GET only fetched a slice.
+	let body = object;
+	if (object.range !== undefined) {
+		let full = await bucket.get(resource_path);
+		if (full === null) {
+			return new Response('Not Found', { status: 404 });
+		}
+		body = full;
+	}
+	let fragment = await marked.parse(await body.text());
+	let bare = url.searchParams.get('bare') === '1';
+	let fileName = resource_path.split('/').pop() ?? resource_path;
+	return new Response(bare ? fragment : renderMarkdownShell(fileName, fragment), {
+		status: 200,
+		headers: {
+			// Deliberately no passthrough of stored Content-Disposition /
+			// Content-Encoding etc. — those describe the stored bytes, not
+			// this converted document.
+			'Content-Type': 'text/html; charset=utf-8',
+			ETag: object.httpEtag,
+			'Last-Modified': object.uploaded.toUTCString(),
+		},
+	});
+}
+
+// Page shell for rendered markdown: same palette/typeface as the directory
+// listing, content in the same card style, plus basic typography for the
+// elements markdown produces and listings don't have.
+function renderMarkdownShell(fileName: string, fragment: string): string {
+	return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>${escapeXml(fileName)}</title>
+<style>
+body {font-family: sans-serif;margin: 5ex 10ex;}
+tt, pre {font-family: WebKitWorkaround, monospace;}
+#content {float: left;max-width: 65ex;margin-right: 5ex;}
+#sidebar {float: left;max-width: 20ex;}
+h1 {font-weight: normal;margin-bottom: 0;}
+h2 {font-size: 100%;margin-bottom: 0;}
+*{box-sizing:border-box;}
+main>:first-child{margin-top:0;}
+main>:last-child{margin-bottom:0;}
+h1,h2,h3,h4,h5,h6{line-height:1.25;margin:1.4em 0 .5em;}
+h1{font-size:26px;border-bottom:1px solid #e2e8f0;padding-bottom:.3em;}
+h2{font-size:21px;border-bottom:1px solid #f1f5f9;padding-bottom:.3em;}
+a{color:#2563eb;text-decoration:none;}
+a:hover{text-decoration:underline;}
+code{font-family:ui-monospace,'Cascadia Code',Menlo,Consolas,monospace;font-size:85%;background:#f1f5f9;padding:.15em .35em;border-radius:4px;}
+pre{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;padding:12px 16px;overflow-x:auto;}
+pre code{background:none;padding:0;font-size:13px;}
+blockquote{margin:1em 0;padding:0 1em;color:#64748b;border-left:3px solid #e2e8f0;}
+table{border-collapse:collapse;display:block;overflow-x:auto;}
+th,td{border:1px solid #e2e8f0;padding:6px 12px;font-size:14px;}
+th{background:#f1f5f9;text-align:left;}
+img{max-width:100%;}
+hr{border:none;border-top:1px solid #e2e8f0;margin:24px 0;}
+</style>
+</head>
+<body>
+<main>
+${fragment}
+</main>
+</body>
+</html>`;
+}
+
+async function handle_head(request: Request, bucket: DavBucket, webMode = false): Promise<Response> {
+	let response = await handle_get(request, bucket, webMode);
 	return new Response(null, {
 		status: response.status,
 		statusText: response.statusText,
@@ -1410,7 +1502,7 @@ async function handle_head(request: Request, bucket: DavBucket): Promise<Respons
 	});
 }
 
-async function handle_get(request: Request, bucket: DavBucket): Promise<Response> {
+async function handle_get(request: Request, bucket: DavBucket, webMode = false): Promise<Response> {
 	let resource_path = make_resource_path(request);
 	let url = new URL(request.url);
 
@@ -1462,6 +1554,20 @@ async function handle_get(request: Request, bucket: DavBucket): Promise<Response
 		if (preconditionStatus === 412 || !isR2ObjectBody(object)) {
 			return new Response('Precondition Failed', { status: 412 });
 		} else {
+			// Browser-facing markdown rendering: a file whose *stored* type is
+			// text/markdown, requested with `?type=text/html`, is converted
+			// instead of relabeled. Every other (stored, requested) combination
+			// keeps plain relabel semantics — which double as the "raw" view
+			// (e.g. `?type=text/plain` on an HTML or markdown file). Never
+			// applies to authenticated/jailed WebDAV traffic.
+			if (
+				webMode &&
+				typeOverride !== null &&
+				baseMimeType(typeOverride) === 'text/html' &&
+				baseMimeType(resolveContentType(object)) === 'text/markdown'
+			) {
+				return await renderMarkdownDocument(bucket, resource_path, object, url);
+			}
 			const { rangeOffset, rangeEnd } = calcContentRange(object);
 			const contentLength = rangeEnd - rangeOffset + 1;
 			const rangeRequested = request.headers.has('Range') && object.range !== undefined;
@@ -2315,7 +2421,11 @@ const SUPPORT_METHODS = [
 	'UNLOCK',
 ];
 
-async function dispatch_handler(request: Request, bucket: DavBucket): Promise<Response> {
+// `webMode` is true only for anonymous browser-facing requests (never for
+// authenticated/jailed WebDAV): it enables browser sugar like the
+// markdown-to-HTML conversion in handle_get. A routing decision made in
+// fetch(), deliberately not inferred from the bucket implementation.
+async function dispatch_handler(request: Request, bucket: DavBucket, webMode = false): Promise<Response> {
 	switch (request.method) {
 		case 'OPTIONS': {
 			return new Response(null, {
@@ -2330,10 +2440,10 @@ async function dispatch_handler(request: Request, bucket: DavBucket): Promise<Re
 			});
 		}
 		case 'HEAD': {
-			return await handle_head(request, bucket);
+			return await handle_head(request, bucket, webMode);
 		}
 		case 'GET': {
-			return await handle_get(request, bucket);
+			return await handle_get(request, bucket, webMode);
 		}
 		case 'PUT': {
 			return await handle_put(request, bucket);
@@ -2455,7 +2565,7 @@ export default {
 				// Public web mode: anonymous read-only access to the whole bucket.
 				// Deliberately no WWW-Authenticate here — browsers must never be
 				// prompted to log in; auth exists only for WebDAV clients.
-				response = await dispatch_handler(request, env.bucket);
+				response = await dispatch_handler(request, env.bucket, true);
 			} else {
 				response = new Response('Unauthorized', {
 					status: 401,
