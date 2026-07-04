@@ -300,6 +300,118 @@ function extractHttpMetadata(headers: Headers): R2HTTPMetadata {
 	};
 }
 
+// Custom-metadata flag marking a content type the user set explicitly (via the
+// `?type=` endpoint). When present, resolveContentType trusts the stored type
+// verbatim instead of second-guessing it against the extension.
+const EXPLICIT_CONTENT_TYPE_KEY = 'ctExplicit';
+
+// Extension -> MIME type for serve-time inference. Deliberately a small, common
+// set; unknown extensions fall back to application/octet-stream.
+const MIME_BY_EXT: Record<string, string> = {
+	// images
+	png: 'image/png',
+	jpg: 'image/jpeg',
+	jpeg: 'image/jpeg',
+	gif: 'image/gif',
+	webp: 'image/webp',
+	avif: 'image/avif',
+	svg: 'image/svg+xml',
+	bmp: 'image/bmp',
+	ico: 'image/x-icon',
+	// video
+	mp4: 'video/mp4',
+	webm: 'video/webm',
+	mov: 'video/quicktime',
+	mkv: 'video/x-matroska',
+	avi: 'video/x-msvideo',
+	// audio
+	mp3: 'audio/mpeg',
+	wav: 'audio/wav',
+	ogg: 'audio/ogg',
+	oga: 'audio/ogg',
+	flac: 'audio/flac',
+	m4a: 'audio/mp4',
+	aac: 'audio/aac',
+	// documents / text
+	pdf: 'application/pdf',
+	txt: 'text/plain',
+	md: 'text/markdown',
+	csv: 'text/csv',
+	json: 'application/json',
+	xml: 'application/xml',
+	yaml: 'application/yaml',
+	yml: 'application/yaml',
+	// web
+	html: 'text/html',
+	htm: 'text/html',
+	css: 'text/css',
+	js: 'text/javascript',
+	mjs: 'text/javascript',
+	wasm: 'application/wasm',
+	// archives
+	zip: 'application/zip',
+	gz: 'application/gzip',
+	tar: 'application/x-tar',
+	'7z': 'application/x-7z-compressed',
+	rar: 'application/vnd.rar',
+	// fonts
+	woff: 'font/woff',
+	woff2: 'font/woff2',
+	ttf: 'font/ttf',
+	otf: 'font/otf',
+};
+
+// Types that mean "no meaningful type": R2/HTTP defaults plus curl's own
+// defaults for `--data-binary` (x-www-form-urlencoded) and `-F` (multipart).
+// Treating these as generic lets extension inference rescue files uploaded with
+// plain curl, which would otherwise be served as an unplayable form body.
+const GENERIC_CONTENT_TYPES = new Set([
+	'application/octet-stream',
+	'binary/octet-stream',
+	'application/x-www-form-urlencoded',
+	'multipart/form-data',
+]);
+
+function isGenericContentType(contentType: string | undefined): boolean {
+	if (contentType === undefined || contentType === '') {
+		return true;
+	}
+	let base = contentType.split(';')[0].trim().toLowerCase();
+	return GENERIC_CONTENT_TYPES.has(base);
+}
+
+function inferContentType(key: string): string | undefined {
+	let name = key.split('/').pop() ?? key;
+	let dot = name.lastIndexOf('.');
+	if (dot <= 0) {
+		// No extension, or a dotfile like ".env" — nothing to infer from.
+		return undefined;
+	}
+	return MIME_BY_EXT[name.slice(dot + 1).toLowerCase()];
+}
+
+// The single source of truth for a file's served content type, shared by GET,
+// the public web view, and PROPFIND so they never disagree.
+function resolveContentType(object: R2Object): string {
+	let stored = object.httpMetadata?.contentType;
+	if (object.customMetadata?.[EXPLICIT_CONTENT_TYPE_KEY] === '1' && stored) {
+		return stored;
+	}
+	if (!isGenericContentType(stored)) {
+		return stored as string;
+	}
+	return inferContentType(object.key) ?? 'application/octet-stream';
+}
+
+// Validates a user-supplied MIME string before it becomes a stored header
+// value. Requires type/subtype, allows parameters after ';', forbids CRLF.
+function isValidMimeType(value: string): boolean {
+	if (value.length === 0 || value.length > 255 || /[\r\n]/.test(value)) {
+		return false;
+	}
+	return /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+\s*(;.*)?$/.test(value);
+}
+
 function parseETagHeader(headerValue: string): { weak: boolean; tag: string }[] {
 	return [...headerValue.matchAll(/(W\/)?"([^"]*)"/g)].map((match) => ({
 		weak: match[1] !== undefined,
@@ -984,7 +1096,7 @@ function fromR2Object(object: R2Object): DavProperties {
 		displayname: object.httpMetadata?.contentDisposition,
 		getcontentlanguage: object.httpMetadata?.contentLanguage,
 		getcontentlength: object.size.toString(),
-		getcontenttype: object.httpMetadata?.contentType,
+		getcontenttype: isCollection ? undefined : resolveContentType(object),
 		// RFC 4918 section 15.6: getetag uses the same format as the HTTP ETag
 		// header, i.e. the quoted form. It must also match the ETag returned by
 		// PUT/GET so clients (notably Windows MiniRedir) can correlate them.
@@ -1231,8 +1343,19 @@ async function handle_head(request: Request, bucket: DavBucket): Promise<Respons
 
 async function handle_get(request: Request, bucket: DavBucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
+	let url = new URL(request.url);
 
-	if (new URL(request.url).pathname.endsWith('/')) {
+	// Read-time Content-Type override: `?type=`/`?content-type=` on a GET (or
+	// HEAD, which delegates here) serves the file with the caller's chosen type
+	// for that one response only — nothing is persisted. Useful for e.g. viewing
+	// an HTML file as text/plain in a browser. Applies to file reads, not
+	// directory listings.
+	let typeOverride = url.searchParams.get('type') ?? url.searchParams.get('content-type');
+	if (typeOverride !== null && !isValidMimeType(typeOverride)) {
+		return new Response('Invalid Content-Type', { status: 400 });
+	}
+
+	if (url.pathname.endsWith('/')) {
 		let entry = await resolveResource(bucket, resource_path);
 		if (entry === null || !isCollectionEntry(entry)) {
 			return new Response('Not Found', { status: 404 });
@@ -1277,7 +1400,7 @@ async function handle_get(request: Request, bucket: DavBucket): Promise<Response
 				status: rangeRequested ? 206 : 200,
 				headers: {
 					'Accept-Ranges': 'bytes',
-					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
+					'Content-Type': typeOverride ?? resolveContentType(object),
 					'Content-Length': contentLength.toString(),
 					ETag: object.httpEtag,
 					'Last-Modified': object.uploaded.toUTCString(),
@@ -1331,8 +1454,13 @@ function calcContentRange(object: R2ObjectBody) {
 	return { rangeOffset, rangeEnd };
 }
 
+// Handles PUT and its curl-friendly POST alias. The request path is always the
+// file destination (no /upload prefix). A `?type=`/`?content-type=` query sets
+// an explicit MIME type; with no request body it becomes a metadata-only
+// "set the type of this existing file" operation.
 async function handle_put(request: Request, bucket: DavBucket): Promise<Response> {
-	if (request.url.endsWith('/')) {
+	let url = new URL(request.url);
+	if (url.pathname.endsWith('/')) {
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
@@ -1341,7 +1469,50 @@ async function handle_put(request: Request, bucket: DavBucket): Promise<Response
 	if (lockResponse !== null) {
 		return lockResponse;
 	}
+
+	let typeParam = url.searchParams.get('type') ?? url.searchParams.get('content-type');
+	let explicitType: string | null = null;
+	if (typeParam !== null) {
+		let trimmed = typeParam.trim();
+		if (!isValidMimeType(trimmed)) {
+			return new Response('Invalid Content-Type', { status: 400 });
+		}
+		explicitType = trimmed;
+	}
+
 	let existing = await bucket.head(resource_path);
+
+	if (checkPreconditions(request, existing) !== null) {
+		return new Response('Precondition Failed', { status: 412 });
+	}
+
+	let body = await request.arrayBuffer();
+
+	// Metadata-only path: `?type=` with no body against an existing file changes
+	// only its content type, preserving the bytes. R2 has no metadata patch, so
+	// we re-put the object with its own body.
+	if (explicitType !== null && body.byteLength === 0 && existing !== null) {
+		if (existing.customMetadata?.resourcetype === '<collection />') {
+			return new Response('Method Not Allowed', { status: 405 });
+		}
+		let src = await bucket.get(resource_path);
+		if (src === null) {
+			return new Response('Not Found', { status: 404 });
+		}
+		let customMetadata = getPreservedCustomMetadata(existing.customMetadata);
+		customMetadata[EXPLICIT_CONTENT_TYPE_KEY] = '1';
+		let putResult = await bucket.put(resource_path, src.body, {
+			httpMetadata: { ...existing.httpMetadata, contentType: explicitType },
+			customMetadata: customMetadata,
+		});
+		return new Response(null, {
+			status: 204,
+			headers: {
+				ETag: putResult.httpEtag,
+				'Last-Modified': putResult.uploaded.toUTCString(),
+			},
+		});
+	}
 
 	// Check if the parent directory exists
 	if (!(await hasCollectionResource(bucket, getParentPath(resource_path)))) {
@@ -1353,14 +1524,18 @@ async function handle_put(request: Request, bucket: DavBucket): Promise<Response
 	// returns null without writing, and this handler would still report
 	// success — the client then ends up with the empty resource created by a
 	// prior LOCK (the "0 KB file" seen from Windows MiniRedir, issue #14).
-	if (checkPreconditions(request, existing) !== null) {
-		return new Response('Precondition Failed', { status: 412 });
-	}
 
-	let body = await request.arrayBuffer();
+	let httpMetadata = extractHttpMetadata(request.headers);
+	let customMetadata = getPreservedCustomMetadata(existing?.customMetadata);
+	// A plain re-upload resets any prior explicit type; `?type=` re-arms it.
+	delete customMetadata[EXPLICIT_CONTENT_TYPE_KEY];
+	if (explicitType !== null) {
+		httpMetadata.contentType = explicitType;
+		customMetadata[EXPLICIT_CONTENT_TYPE_KEY] = '1';
+	}
 	let putResult = await bucket.put(resource_path, body, {
-		httpMetadata: extractHttpMetadata(request.headers),
-		customMetadata: getPreservedCustomMetadata(existing?.customMetadata),
+		httpMetadata: httpMetadata,
+		customMetadata: customMetadata,
 	});
 	// Windows MiniRedir relies on the ETag of a PUT response to confirm the
 	// write and invalidate its cached PROPFIND state.
@@ -2063,6 +2238,7 @@ const SUPPORT_METHODS = [
 	'GET',
 	'HEAD',
 	'PUT',
+	'POST',
 	'DELETE',
 	'COPY',
 	'MOVE',
@@ -2091,6 +2267,10 @@ async function dispatch_handler(request: Request, bucket: DavBucket): Promise<Re
 			return await handle_get(request, bucket);
 		}
 		case 'PUT': {
+			return await handle_put(request, bucket);
+		}
+		case 'POST': {
+			// curl-friendly upload / set-type alias: the path is the destination.
 			return await handle_put(request, bucket);
 		}
 		case 'DELETE': {

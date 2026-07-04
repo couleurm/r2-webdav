@@ -20,6 +20,52 @@ The Worker serves two audiences from the same bucket:
 There is no registration page, no admin panel, and no root account —
 administrators manage accounts and data directly through KV and R2.
 
+## Content types (MIME)
+
+A file's content type decides whether the browser shows it inline (image, video,
+PDF) or downloads it. Resolution order when serving a file:
+
+1. A type set **explicitly** by the user (via `?type=`, see below) — used verbatim.
+2. Otherwise the type stored at upload, if it's a real one.
+3. Otherwise inferred from the file **extension** (`.mp4` → `video/mp4`, etc.).
+4. Otherwise `application/octet-stream`.
+
+Generic upload defaults — `application/octet-stream`, and curl's own
+`application/x-www-form-urlencoded` (`--data-binary`) / `multipart/form-data`
+(`-F`) — count as "no real type", so extension inference takes over. That means
+plain curl uploads and correctly-named files just work without extra flags.
+
+### curl endpoints
+
+The request path is always the destination — there is no `/upload` prefix.
+Uploads accept both `PUT` and `POST`. All of these are jailed to the caller's
+own directory and require Basic auth.
+
+```bash
+# upload a file (type inferred from the .mp4 extension)
+curl -u foo:pass -T ./clip.mp4            https://<host>/clip.mp4
+curl -u foo:pass --data-binary @clip.mp4  https://<host>/clip.mp4   # POST works too
+
+# upload and set the type explicitly
+curl -u foo:pass --data-binary @blob "https://<host>/clip?type=video/mp4"
+
+# change the type of an EXISTING file, without re-uploading (no body)
+curl -u foo:pass -X POST "https://<host>/report.bin?type=application/pdf"
+
+# read a file AS a different type, for this request only (nothing stored)
+curl "https://<host>/about.html?type=text/plain"
+```
+
+`?type=` (alias `?content-type=`) takes a `type/subtype[; params]` string;
+anything malformed returns `400`.
+
+- On upload/`POST`, it sets the stored type: an explicit type sticks across
+  serving and `PROPFIND`, and a later plain re-upload clears it and reverts to
+  inference.
+- On `GET`/`HEAD`, it overrides the served `Content-Type` for that one response
+  only — nothing is stored. Handy for viewing an HTML page as `text/plain` in a
+  browser. Works on the anonymous web view too (no auth needed to read).
+
 ## Usage
 
 Change wrangler.toml to your own.
