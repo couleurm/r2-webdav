@@ -1242,31 +1242,85 @@ function redirectToCollection(resourcePath: string): Response {
 	});
 }
 
-async function renderDirectoryListing(bucket: DavBucket, resource_path: string): Promise<Response> {
+async function renderDirectoryListing(bucket: DavBucket, resource_path: string, url: URL): Promise<Response> {
 	let prefix = resource_path === '' ? '' : resource_path + '/';
 
-	type ListingRow = { name: string; href: string; isDirectory: boolean; size: string; uploaded: string };
-	let rows: ListingRow[] = [];
-	for await (let entry of listEntries(bucket, prefix)) {
-		let isDirectory = isCollectionEntry(entry);
-		rows.push({
-			name: entry.key.slice(prefix.length) + (isDirectory ? '/' : ''),
-			href: getResourceHref(entry.key, isDirectory),
-			isDirectory,
-			size: isDirectory || isDirectoryEntry(entry) ? '' : formatFileSize(entry.size),
-			uploaded: isDirectoryEntry(entry) ? '' : entry.uploaded.toISOString().replace('T', ' ').slice(0, 19) + ' UTC',
-		});
+	type ListingRow = {
+		name: string;
+		href: string;
+		isDirectory: boolean;
+		sizeBytes: number | null;
+		modifiedMs: number | null;
+	};
+
+	// A single recursive walk yields the same immediate children as the
+	// non-recursive listing (a directory appears iff it has a marker or any
+	// descendant), and additionally lets us aggregate each directory's total
+	// size and newest upload time from its descendants. R2 has no directory
+	// mtime, so "modified" is the max `uploaded` over everything inside,
+	// including explicit MKCOL markers (which gives empty explicit dirs their
+	// creation time).
+	let directories = new Map<string, { sizeBytes: number; modifiedMs: number | null }>();
+	let files: ListingRow[] = [];
+	for await (let entry of listEntries(bucket, prefix, true)) {
+		let relativeKey = entry.key.slice(prefix.length);
+		let childName = relativeKey.split('/')[0];
+		if (childName === '') {
+			// An object whose key is literally the prefix + '/' (e.g. a stray
+			// key of '/' at the root) has no name to list under.
+			continue;
+		}
+		if (!isDirectoryEntry(entry) && !relativeKey.includes('/') && !isCollectionEntry(entry)) {
+			files.push({
+				name: childName,
+				href: getResourceHref(entry.key, false),
+				isDirectory: false,
+				sizeBytes: entry.size,
+				modifiedMs: entry.uploaded.getTime(),
+			});
+			continue;
+		}
+		let aggregate = directories.get(childName) ?? { sizeBytes: 0, modifiedMs: null };
+		if (!isDirectoryEntry(entry)) {
+			aggregate.sizeBytes += entry.size;
+			aggregate.modifiedMs = Math.max(aggregate.modifiedMs ?? 0, entry.uploaded.getTime());
+		}
+		directories.set(childName, aggregate);
 	}
+	let rows: ListingRow[] = [...directories.entries()].map(([childName, aggregate]) => ({
+		name: childName + '/',
+		href: getResourceHref(prefix + childName, true),
+		isDirectory: true,
+		sizeBytes: aggregate.sizeBytes,
+		modifiedMs: aggregate.modifiedMs,
+	}));
+	rows.push(...files);
+
+	type SortKey = 'name' | 'size' | 'modified';
+	let sortParam = url.searchParams.get('sort');
+	let sort: SortKey = sortParam === 'size' || sortParam === 'modified' ? sortParam : 'name';
+	let order: 'asc' | 'desc' = url.searchParams.get('order') === 'desc' ? 'desc' : 'asc';
+	let direction = order === 'desc' ? -1 : 1;
+	const compareBySortKey = (left: ListingRow, right: ListingRow): number => {
+		if (sort === 'size') return (left.sizeBytes ?? -1) - (right.sizeBytes ?? -1);
+		if (sort === 'modified') return (left.modifiedMs ?? -1) - (right.modifiedMs ?? -1);
+		return left.name.localeCompare(right.name);
+	};
+	// Directories always group before files; the sort applies within each group.
 	rows.sort((left, right) =>
-		left.isDirectory !== right.isDirectory ? (left.isDirectory ? -1 : 1) : left.name.localeCompare(right.name),
+		left.isDirectory !== right.isDirectory
+			? left.isDirectory
+				? -1
+				: 1
+			: compareBySortKey(left, right) * direction || left.name.localeCompare(right.name),
 	);
 	if (resource_path !== '') {
 		rows.unshift({
 			name: '../',
 			href: getResourceHref(getParentPath(resource_path), true),
 			isDirectory: true,
-			size: '',
-			uploaded: '',
+			sizeBytes: null,
+			modifiedMs: null,
 		});
 	}
 
@@ -1278,14 +1332,27 @@ async function renderDirectoryListing(bucket: DavBucket, resource_path: string):
 	}
 
 	let listing = rows
-		.map(
-			(row) =>
-				`<tr><td><a class="${row.isDirectory ? 'dir' : 'file'}" href="${escapeXml(row.href)}">${escapeXml(row.name)}</a></td><td class="size">${escapeXml(row.size)}</td><td class="modified">${escapeXml(row.uploaded)}</td></tr>`,
-		)
+		.map((row) => {
+			let size = row.sizeBytes === null ? '' : formatFileSize(row.sizeBytes);
+			let modified =
+				row.modifiedMs === null ? '' : new Date(row.modifiedMs).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+			return `<tr><td><a class="${row.isDirectory ? 'dir' : 'file'}" href="${escapeXml(row.href)}">${escapeXml(row.name)}</a></td><td class="size">${escapeXml(size)}</td><td class="modified">${escapeXml(modified)}</td></tr>`;
+		})
 		.join('\n');
 	if (listing === '') {
 		listing = '<tr><td class="empty" colspan="3">This directory is empty.</td></tr>';
 	}
+
+	// Each header is a link that sorts by its column; clicking the active
+	// column again flips the order. Relative `?query` hrefs keep the current
+	// directory path.
+	const headerCell = (label: string, key: SortKey) => {
+		let isActive = sort === key;
+		let nextOrder = isActive && order === 'asc' ? 'desc' : 'asc';
+		let arrow = isActive ? (order === 'asc' ? ' ▲' : ' ▼') : '';
+		return `<th><a href="?sort=${key}&amp;order=${nextOrder}">${label}${arrow}</a></th>`;
+	};
+	let tableHeader = headerCell('Name', 'name') + headerCell('Size', 'size') + headerCell('Modified', 'modified');
 
 	let pageSource = `<!DOCTYPE html>
 <html lang="en">
@@ -1302,6 +1369,8 @@ h1{font-size:20px;margin:0 0 16px;}
 .breadcrumbs a:hover{text-decoration:underline;}
 table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;}
 th{text-align:left;padding:8px 12px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#64748b;background:#f1f5f9;border-bottom:1px solid #e2e8f0;}
+th a{color:inherit;text-decoration:none;}
+th a:hover{color:#2563eb;}
 td{padding:6px 12px;font-size:14px;border-bottom:1px solid #f1f5f9;}
 tr:last-child td{border-bottom:none;}
 tr:hover td{background:#f8fafc;}
@@ -1318,7 +1387,7 @@ td.empty{padding:32px;text-align:center;color:#94a3b8;}
 <h1>R2 Storage</h1>
 <div class="breadcrumbs">${breadcrumbs}</div>
 <table>
-<thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
+<thead><tr>${tableHeader}</tr></thead>
 <tbody>
 ${listing}
 </tbody>
@@ -1360,7 +1429,7 @@ async function handle_get(request: Request, bucket: DavBucket): Promise<Response
 		if (entry === null || !isCollectionEntry(entry)) {
 			return new Response('Not Found', { status: 404 });
 		}
-		return await renderDirectoryListing(bucket, resource_path);
+		return await renderDirectoryListing(bucket, resource_path, url);
 	} else {
 		let object = await bucket.get(resource_path, {
 			range: request.headers,
