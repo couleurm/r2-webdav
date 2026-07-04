@@ -8,13 +8,13 @@ compatibility_flags = ["nodejs_compat"]
 # Docs: https://developers.cloudflare.com/r2/api/workers/workers-api-usage/
 [[r2_buckets]]
 binding = "bucket" # <~ valid JavaScript variable name
-bucket_name = "webdav"
+bucket_name = "lava" # <~ target r2 bucket
 
 # WebDAV accounts: key `user:<username>`, value `{"password":"..."}`.
 # Seed with: wrangler kv key put "user:foo" '{"password":"..."}' --binding=users --remote
 [[kv_namespaces]]
-binding = "users"
-id = "put a kv id here.."
+binding = "users" # <~ target kv
+id = "d4d6111b10104e218668c715e093df8d" # <~ also comes with an id
 
 # Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/#enable-workers-logs
 [observability]
